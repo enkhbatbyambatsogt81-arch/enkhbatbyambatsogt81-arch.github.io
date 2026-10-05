@@ -203,7 +203,7 @@ function coursesHTML(){
   if (!list.length) return head + `<div class="empty"><p>${isAdmin() ? '«Хичээл нэмэх» товчоор үзсэн хичээлээ нэмнэ үү.' : 'Хичээл хараахан нэмэгдээгүй байна.'}</p></div>`;
   const bulk = isAdmin() ? `<section class="panel dropzone" data-dropzone="bulk" style="margin-bottom:26px">
     <div class="sechead" style="margin:0"><h3>Бүх хичээлийн файлыг нэг дор оруулах</h3><button class="btn small primary" data-act="bulk-pick">Хавтас сонгох</button></div>
-    ${S.uploading ? `<div class="uploading">${esc(S.uploading)}</div>` : ''}
+    ${uploadingHTML()}
     <p class="note">Хичээл бүрийн хавтсыг агуулсан хавтсаа (жишээ нь «Сайтад оруулах») энд чирж оруулна уу. «ECEN213 Компьютерын сүлжээ» гэх мэт хичээлийн кодоор эхэлсэн хавтас бүр тухайн хичээл рүү доторх бүтэцтэйгээ орно. Байршуулж дуустал энэ хуудсыг бүү хаагаарай.</p></section>` : '';
   const groups = new Map();
   for (const c of list){ const k = (c.semester || '').trim(); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(c); }
@@ -256,7 +256,7 @@ function detailHTML(){
           <button class="btn small primary" data-act="upload-folder" data-folder="">Хавтас оруулах</button>
           <button class="btn small" data-act="upload-files" data-folder="">Файл нэмэх</button>
           <button class="btn small" data-act="new-folder">Шинэ хавтас</button></div></div>
-      ${S.uploading ? `<div class="uploading">${esc(S.uploading)}</div>` : ''}
+      ${uploadingHTML()}
       ${tools ? `<div class="ftools">${tools}</div>` : ''}
       ${list.length ? `<div class="flist">${treeHTML(buildTree(list), c.id, true, 0)}</div>` : ''}
       <div class="dropnote">Компьютер дээрх хавтас эсвэл файлаа энд чирч оруулна. Хавтасны мөр дээр буулгавал тэр хавтас руу орно.</div>
@@ -718,11 +718,35 @@ function cleanPath(p){
   if (segs.some(s => s === '.' || s === '..')) return '';
   return segs.join('/');
 }
+/* an upload in progress can be stopped; a request that never answers (a laptop that slept) gives up
+   after a while instead of holding the queue forever */
+let cancelUpload = false;
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('Хугацаа хэтэрлээ (сүлжээ тасарсан байж магадгүй).')), ms))]);
+const uploadingHTML = () => S.uploading
+  ? `<div class="ftools uploading"><span>${esc(S.uploading)}</span>${cancelUpload ? '' : '<button class="btn small ghost" data-act="upload-stop">Зогсоох</button>'}</div>` : '';
+async function putObject(key, file){
+  const ms = 120000 + file.size / 25;          /* two minutes plus ~25 KB/s */
+  let tries = 0, refreshed = false;
+  for (;;){
+    try { await withTimeout(run(sb.storage.from(BUCKET).upload(key, file, {contentType:mimeOf(file), upsert:true})), ms); return; }
+    catch (e){
+      const m = String(e && e.message);
+      if (!refreshed && /jwt|expired|401|403|Unauthorized/i.test(m)){ refreshed = true; await sb.auth.refreshSession(); continue; }
+      if (/rate|429|503|timeout|Хугацаа|Failed to fetch/i.test(m) && tries++ < 3 && !cancelUpload){
+        await new Promise(res => setTimeout(res, 2500 * tries));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
 /* items: [{file, path}] or [{skip: path}] — path is relative to the course root.
-   opts.quiet: no toast (the bulk import reports once); opts.label prefixes the progress line.
-   Resolves {ok, skipped:[paths], fails:[messages]}. */
+   A file already there with the same path and size is left alone, so dropping the same folder again
+   only sends what is missing. opts.quiet: no toast (the bulk import reports once); opts.label prefixes
+   the progress line. Resolves {ok, already, skipped:[paths], fails:[messages], stopped}. */
 async function uploadItems(courseId, raw, openFolder, opts = {}){
-  if (S.uploading && !opts.quiet){ toast('Өмнөх байршуулалт дуусаагүй байна. Түр хүлээнэ үү.', 'err'); return {ok:0, skipped:[], fails:[]}; }
+  if (S.uploading && !opts.quiet){ toast('Өмнөх байршуулалт дуусаагүй байна. «Зогсоох» дарж зогсоогоод дахин оролдоно уу.', 'err'); return {ok:0, already:0, skipped:[], fails:[]}; }
+  if (!opts.quiet) cancelUpload = false;
   const skipped = new Set(), fails = [], items = [];
   for (const it of raw){
     if (it.skip){ skipped.add(it.skip); continue; }
@@ -737,41 +761,34 @@ async function uploadItems(courseId, raw, openFolder, opts = {}){
   const skipText = skipped.size ? `Алгассан: ${[...skipped].slice(0, 6).join(', ')}${skipped.size > 6 ? ` болон өөр ${skipped.size - 6}` : ''}` : '';
   if (!items.length){
     if (!opts.quiet) toast(['Оруулах боломжтой файл олдсонгүй', skipText, ...fails].filter(Boolean).join('. '), 'err');
-    return {ok:0, skipped:[...skipped], fails};
+    return {ok:0, already:0, skipped:[...skipped], fails};
   }
+  await reload('files');                     /* what an earlier, interrupted upload already managed to send */
   const existing = new Map(S.files.filter(f => f.courseId === courseId).map(f => [f.name, f]));
   const pre = opts.label ? opts.label + ' · ' : '';
-  let ok = 0;
+  let ok = 0, already = 0, stopped = false;
   for (let i = 0; i < items.length; i++){
+    if (cancelUpload){ stopped = true; break; }
     const {file, path} = items[i];
+    const old = existing.get(path);
+    if (old && Number(old.size) === file.size){ already++; continue; }
     S.uploading = `${pre}Байршуулж байна ${i + 1}/${items.length}: ${path}`; render();
     try {
       const key = storageKey(courseId, file.name);
-      let tries = 0;
-      for (;;){
-        try { await run(sb.storage.from(BUCKET).upload(key, file, {contentType:mimeOf(file), upsert:false})); break; }
-        catch (e){
-          if (/rate|429|503|timeout|Failed to fetch/i.test(String(e && e.message)) && tries++ < 4){
-            S.uploading = `${pre}Сервер завгүй байна, хүлээж байна… ${i + 1}/${items.length}: ${path}`; render();
-            await new Promise(res => setTimeout(res, 2500 * tries));
-            continue;
-          }
-          throw e;
-        }
-      }
-      const old = existing.get(path);
-      const row = await run(sb.from('files').upsert({course_id:courseId, name:path, size:file.size, mime:mimeOf(file), storage_path:key,
-        created_at:new Date().toISOString()}, {onConflict:'course_id,name'}).select().single());
+      await putObject(key, file);
+      const row = await withTimeout(run(sb.from('files').upsert({course_id:courseId, name:path, size:file.size, mime:mimeOf(file), storage_path:key,
+        created_at:new Date().toISOString()}, {onConflict:'course_id,name'}).select().single()), 60000);
       if (old && old.path !== key) sb.storage.from(BUCKET).remove([old.path]).catch(() => {});
       existing.set(path, mapFile(row));
       ok++;
     } catch (e){ fails.push(`${path}: ${errMsg(e)}`); }
   }
-  if (!opts.quiet) S.uploading = '';
+  if (!opts.quiet){ S.uploading = ''; cancelUpload = false; }
   if (openFolder) S.open.add(courseId + ':' + openFolder);
   await reload('files');
-  if (!opts.quiet) toast([`${ok} файл орлоо`, skipText, fails.length ? 'Орж чадаагүй: ' + fails.join('; ') : ''].filter(Boolean).join('. '), fails.length ? 'err' : '');
-  return {ok, skipped:[...skipped], fails};
+  if (!opts.quiet) toast([`${ok} файл орлоо`, already ? `${already} нь өмнө орсон тул алгассан` : '', stopped ? 'Зогсоосон' : '', skipText,
+    fails.length ? 'Орж чадаагүй: ' + fails.join('; ') : ''].filter(Boolean).join('. '), fails.length ? 'err' : '');
+  return {ok, already, skipped:[...skipped], fails, stopped};
 }
 /* One drop for every course: each top folder whose name starts with a course code
    ("ECEN213 Компьютерын сүлжээ/…") goes to that course; the path below it is kept. */
@@ -796,27 +813,31 @@ async function bulkImport(raw){
   }
   const report = [];
   S.bulkReport = null;
+  cancelUpload = false;
   const list = [...groups.values()];
-  for (let n = 0; n < list.length; n++){
+  for (let n = 0; n < list.length && !cancelUpload; n++){
     const {course, items} = list[n];
     const r = await uploadItems(course.id, items, '', {quiet:true, label:`${n + 1}/${list.length} ${course.code}`});
     report.push({code:course.code, name:course.name, ...r});
   }
-  S.uploading = '';
-  S.bulkReport = {rows:report, unmatched:[...unmatched]};
+  const stopped = cancelUpload;
+  S.uploading = ''; cancelUpload = false;
+  S.bulkReport = {rows:report, unmatched:[...unmatched], stopped};
   render();
-  const ok = report.reduce((s, r) => s + r.ok, 0), bad = report.reduce((s, r) => s + r.fails.length, 0);
-  toast(`${list.length} хичээлд ${ok} файл орлоо${bad ? `, ${bad} файл орж чадсангүй` : ''}.`, bad ? 'err' : '');
+  const ok = report.reduce((s, r) => s + r.ok, 0), already = report.reduce((s, r) => s + (r.already || 0), 0);
+  const bad = report.reduce((s, r) => s + r.fails.length, 0);
+  toast(`${stopped ? 'Зогсоосон. ' : ''}${report.length} хичээлд ${ok} шинэ файл орлоо${already ? `, ${already} нь өмнө орсон байсан` : ''}${bad ? `, ${bad} файл орж чадсангүй` : ''}.`, bad ? 'err' : '');
 }
 function bulkReportHTML(){
   const b = S.bulkReport; if (!b) return '';
   return `<section class="panel"><div class="sechead" style="margin:0"><h3>Сүүлийн байршуулалт</h3><button class="btn small ghost" data-act="bulk-close">Хаах</button></div>
     <div class="flist">${b.rows.map(r => `<div class="frow"><span class="ext">${r.fails.length ? '!' : '✓'}</span>
       <div style="min-width:0"><div class="titleline"><span class="code">${esc(r.code)}</span><span>${esc(r.name || '')}</span></div>
-      <div class="fmeta">${r.ok} файл орсон${r.skipped.length ? ` · ${r.skipped.length} алгассан` : ''}${r.fails.length ? ` · ${r.fails.length} алдаа` : ''}</div>
+      <div class="fmeta">${r.ok} шинэ файл орсон${r.already ? ` · ${r.already} өмнө орсон` : ''}${r.skipped.length ? ` · ${r.skipped.length} алгассан` : ''}${r.fails.length ? ` · ${r.fails.length} алдаа` : ''}${r.stopped ? ' · зогсоосон' : ''}</div>
       ${r.fails.length ? `<p class="note" style="color:var(--danger)">${r.fails.map(esc).join('<br>')}</p>` : ''}
       ${r.skipped.length ? `<p class="note">Алгассан: ${r.skipped.slice(0, 8).map(esc).join(', ')}${r.skipped.length > 8 ? ' …' : ''}</p>` : ''}</div><span></span></div>`).join('')}</div>
-    ${b.unmatched.length ? `<p class="note">Хичээл нь олдоогүй хавтас: ${b.unmatched.slice(0, 8).map(esc).join(', ')}</p>` : ''}</section>`;
+    ${b.unmatched.length ? `<p class="note">Хичээл нь олдоогүй хавтас: ${b.unmatched.slice(0, 8).map(esc).join(', ')}</p>` : ''}
+    ${b.stopped ? '<p class="note">Байршуулалтыг зогсоосон. Үргэлжлүүлэх бол ижил хавтсаа дахин чирнэ үү, өмнө орсон файлууд алгасагдана.</p>' : ''}</section>`;
 }
 /* read dropped files and folders, keeping their relative paths */
 function collectDrop(dt){
@@ -908,6 +929,7 @@ const A = {
   'tag-filter': d => { S.tagFilter = d.tag || ''; render(); },
   'bulk-pick': () => { if (!isAdmin()) return; S.uploadTarget = {bulk:true}; const i = $('#up-folder'); i.value = ''; i.click(); },
   'bulk-close': () => { S.bulkReport = null; render(); },
+  'upload-stop': () => { cancelUpload = true; S.uploading = 'Зогсоож байна… (одоогийн файл дуусахыг хүлээж байна)'; render(); },
   'dir-toggle': d => { S.open.has(d.key) ? S.open.delete(d.key) : S.open.add(d.key); render(); },
   'dir-all': d => {
     const keys = dirPaths(courseFiles(d.course)).map(p => d.course + ':' + p);
